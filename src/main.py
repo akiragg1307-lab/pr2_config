@@ -1,8 +1,8 @@
 """Инструмент визуализации графа зависимостей Maven-пакетов.
 
-Этап 2. Сбор данных: по URL Maven-репозитория скачивается POM-файл
-пакета (с учётом родительских POM, свойств и dependencyManagement)
-и выводятся все прямые зависимости. Сторонние библиотеки не нужны.
+Этап 3. Основные операции: построение графа зависимостей с учётом
+транзитивности алгоритмом DFS без рекурсии, обработка циклических
+зависимостей и режим работы с тестовым репозиторием.
 """
 
 import argparse
@@ -375,16 +375,149 @@ class MavenRepository:
             for raw in pom.dependencies
         ]
 
+    def dependencies(self, name):
+        """Вернуть имена транзитивно наследуемых прямых зависимостей."""
+        return [
+            item.name
+            for item in self.direct_dependencies(name)
+            if item.is_transitive()
+        ]
 
-def print_direct_dependencies(name, dependencies):
-    """Вывести все прямые зависимости пакета с их областью (scope)."""
-    print(f"Прямые зависимости пакета {name}:")
-    for item in dependencies:
-        flags = item.scope + (", optional" if item.optional else "")
-        print(f"  {item.name} [{flags}]")
-    if not dependencies:
-        print("  (нет зависимостей)")
-    print(f"Всего: {len(dependencies)}")
+
+def parse_test_line(line, number):
+    """Разобрать строку тестового репозитория вида 'A: B C'."""
+    if ":" not in line:
+        raise RepositoryError(
+            f"строка {number}: ожидается формат 'A: B C', получено '{line}'"
+        )
+    name, _, rest = line.partition(":")
+    name = name.strip()
+    dependencies = rest.replace(",", " ").split()
+    for item in [name, *dependencies]:
+        if not TEST_NAME_RE.match(item):
+            raise RepositoryError(
+                f"строка {number}: некорректное имя пакета '{item}'"
+            )
+    return name, dependencies
+
+
+def parse_test_repository(text):
+    """Разобрать файл описания графа тестового репозитория."""
+    graph = {}
+    for number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, dependencies = parse_test_line(line, number)
+        if name in graph:
+            raise RepositoryError(
+                f"строка {number}: пакет {name} описан повторно"
+            )
+        graph[name] = dependencies
+    return graph
+
+
+class LocalTestRepository:
+    """Тестовый репозиторий: граф из файла, пакеты названы буквами A-Z."""
+
+    def __init__(self, path):
+        """Прочитать файл описания графа."""
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            raise RepositoryError(f"не удалось прочитать {path}") from error
+        self.graph = parse_test_repository(text)
+
+    def canonical_name(self, name):
+        """Проверить, что пакет описан в тестовом репозитории."""
+        if name not in self.graph:
+            raise RepositoryError(
+                f"пакет {name} отсутствует в тестовом репозитории"
+            )
+        return name
+
+    def dependencies(self, name):
+        """Вернуть прямые зависимости пакета (необъявленный — лист)."""
+        return list(self.graph.get(name, []))
+
+
+def create_source(config):
+    """Создать источник данных согласно режиму работы."""
+    if config.test_mode:
+        return LocalTestRepository(config.repository)
+    return MavenRepository(config.repository)
+
+
+@dataclass
+class DependencyGraph:
+    """Граф зависимостей: смежность, найденные циклы, предупреждения."""
+
+    root: str
+    edges: dict = field(default_factory=dict)
+    cycles: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+
+    def add_cycle(self, path, node):
+        """Сохранить цикл: часть текущего пути от node и сам node."""
+        self.cycles.append(path[path.index(node):] + [node])
+
+
+def fetch_safely(source, name, warnings):
+    """Получить зависимости узла; при ошибке считать узел листом."""
+    try:
+        return source.dependencies(name)
+    except RepositoryError as error:
+        warnings.append(f"{name}: {error}")
+        return []
+
+
+def build_graph(source, root):
+    """Построить граф зависимостей DFS без рекурсии (явный стек).
+
+    Узел на текущем пути (множество on_path) при повторной встрече
+    означает обратное ребро, то есть циклическую зависимость: цикл
+    запоминается, а повторный обход не выполняется.
+    """
+    graph = DependencyGraph(root=root)
+    graph.edges[root] = source.dependencies(root)
+    stack = [(root, iter(graph.edges[root]))]
+    on_path = {root}
+    while stack:
+        node, children = stack[-1]
+        child = next(children, None)
+        if child is None:
+            stack.pop()
+            on_path.discard(node)
+        elif child in on_path:
+            graph.add_cycle([name for name, _ in stack], child)
+        elif child not in graph.edges:
+            graph.edges[child] = fetch_safely(source, child, graph.warnings)
+            stack.append((child, iter(graph.edges[child])))
+            on_path.add(child)
+    return graph
+
+
+def print_graph(graph):
+    """Вывести граф зависимостей в виде списков смежности."""
+    edge_count = sum(len(children) for children in graph.edges.values())
+    print(f"Граф зависимостей пакета {graph.root} "
+          f"(узлов: {len(graph.edges)}, рёбер: {edge_count}):")
+    for name, children in graph.edges.items():
+        print(f"  {name} -> {', '.join(children) or '(нет зависимостей)'}")
+    print()
+
+
+def print_problems(graph):
+    """Вывести найденные циклы и предупреждения."""
+    if graph.cycles:
+        print("Обнаружены циклические зависимости:")
+        for cycle in graph.cycles:
+            print("  " + " -> ".join(cycle))
+        print()
+    else:
+        print("Циклических зависимостей нет.")
+    for warning in graph.warnings:
+        print(f"Предупреждение: {warning}", file=sys.stderr)
 
 
 def parse_args(argv):
@@ -403,17 +536,16 @@ def run(args):
     """Выполнить программу и вернуть код завершения."""
     try:
         config = load_config(args.config)
-        if config.test_mode:
-            raise ConfigError("тестовый режим поддерживается с этапа 3")
-        repository = MavenRepository(config.repository)
-        name = repository.canonical_name(config.package_name)
-        print_direct_dependencies(name, repository.direct_dependencies(name))
+        source = create_source(config)
+        graph = build_graph(source, source.canonical_name(config.package_name))
     except ConfigError as error:
         print(f"Ошибка конфигурации: {error}", file=sys.stderr)
         return EXIT_ERROR
     except RepositoryError as error:
         print(f"Ошибка репозитория: {error}", file=sys.stderr)
         return EXIT_ERROR
+    print_graph(graph)
+    print_problems(graph)
     return EXIT_OK
 
 

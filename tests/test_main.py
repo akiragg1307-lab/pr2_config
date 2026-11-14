@@ -169,3 +169,63 @@ class TestPom(unittest.TestCase):
         optional_dep = main.Dependency("g", "b", "1", optional=True)
         self.assertFalse(test_dep.is_transitive())
         self.assertFalse(optional_dep.is_transitive())
+
+class FakeSource:
+    """Источник зависимостей на основе словаря (для тестов)."""
+
+    def __init__(self, graph):
+        """Запомнить граф."""
+        self.graph = graph
+
+    def canonical_name(self, name):
+        """Вернуть имя без изменений."""
+        return name
+
+    def dependencies(self, name):
+        """Вернуть зависимости узла."""
+        return list(self.graph.get(name, []))
+
+
+class TestGraph(TempDirTestCase):
+    """Этап 3: построение графа DFS без рекурсии, циклы."""
+
+    def test_parse_test_repository(self):
+        """Файл тестового репозитория разбирается в словарь."""
+        graph = main.parse_test_repository("# comment\nA: B, C\nB: C\nC:\n")
+        self.assertEqual(graph, {"A": ["B", "C"], "B": ["C"], "C": []})
+
+    def test_parse_rejects_bad_names(self):
+        """Имена не из больших латинских букв — ошибка."""
+        with self.assertRaises(main.RepositoryError):
+            main.parse_test_repository("A: b\n")
+
+    def test_local_repository_missing_package(self):
+        """Корневой пакет должен быть описан в файле."""
+        repo = main.LocalTestRepository(self.write("r.txt", "A: B\n"))
+        with self.assertRaises(main.RepositoryError):
+            repo.canonical_name("Z")
+
+    def test_transitive_dependencies(self):
+        """Граф содержит транзитивные зависимости, каждую один раз."""
+        source = FakeSource({"A": ["B", "C"], "B": ["D"], "C": ["D"]})
+        graph = main.build_graph(source, "A")
+        self.assertEqual(set(graph.edges), {"A", "B", "C", "D"})
+        self.assertEqual(graph.cycles, [])
+
+    def test_cycle_detected(self):
+        """Цикл находится, обход завершается."""
+        source = FakeSource({"A": ["B"], "B": ["C"], "C": ["A"]})
+        graph = main.build_graph(source, "A")
+        self.assertEqual(graph.cycles, [["A", "B", "C", "A"]])
+
+    def test_self_loop(self):
+        """Петля пакета на самого себя тоже является циклом."""
+        graph = main.build_graph(FakeSource({"A": ["A"]}), "A")
+        self.assertEqual(graph.cycles, [["A", "A"]])
+
+    def test_deep_chain_without_recursion(self):
+        """Длинная цепочка не вызывает RecursionError."""
+        length = sys.getrecursionlimit() * len("AB")
+        chain = {f"N{i}": [f"N{i + 1}"] for i in range(length)}
+        graph = main.build_graph(FakeSource(chain), "N0")
+        self.assertEqual(len(graph.edges), length + 1)
