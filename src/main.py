@@ -1,22 +1,28 @@
 """Инструмент визуализации графа зависимостей Maven-пакетов.
 
-Этап 4. Дополнительные операции: режим вывода порядка загрузки
-зависимостей (флаг --load-order) — зависимости идут раньше пакетов,
-которые от них зависят.
+Этап 5. Визуализация: текстовое представление графа на языке PlantUML,
+изображение графа и (по параметру ascii_tree) ASCII-дерево зависимостей.
 """
 
 import argparse
+import base64
 import configparser
 import re
+import shutil
+import string
+import subprocess
 import sys
 import urllib.error
 import urllib.request
+import webbrowser
 import xml.etree.ElementTree as ET
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 EXIT_OK = 0
 EXIT_ERROR = 1
+
 SECTION = "settings"
 DEFAULT_CONFIG = "config.ini"
 CONFIG_KEYS = ("package_name", "repository", "test_mode", "ascii_tree")
@@ -36,6 +42,22 @@ MAX_INTERPOLATION_PASSES = 5
 PROPERTY_RE = re.compile(r"\$\{([^}]+)\}")
 RAW_DEPENDENCY_KEYS = ("groupId", "artifactId", "version", "scope", "optional")
 
+PLANTUML_SERVER = "https://www.plantuml.com/plantuml/png/"
+PLANTUML_TIMEOUT = 60
+BASE64_GROUP = 3
+BASE64_TO_PLANTUML = str.maketrans(
+    string.ascii_uppercase + string.ascii_lowercase + string.digits + "+/",
+    string.digits + string.ascii_uppercase + string.ascii_lowercase + "-_",
+)
+DEFAULT_OUTPUT_DIR = "output"
+
+TREE_BRANCH = "├── "
+TREE_LAST = "└── "
+TREE_PIPE = "│   "
+TREE_SPACE = "    "
+MARK_CYCLE = " (цикл)"
+MARK_REPEAT = " (*)"
+
 
 class ConfigError(Exception):
     """Ошибка в конфигурационном файле или в значении параметра."""
@@ -43,6 +65,10 @@ class ConfigError(Exception):
 
 class RepositoryError(Exception):
     """Ошибка получения или разбора данных репозитория."""
+
+
+class VisualizationError(Exception):
+    """Ошибка построения изображения графа."""
 
 
 @dataclass
@@ -461,6 +487,14 @@ class DependencyGraph:
         """Сохранить цикл: часть текущего пути от node и сам node."""
         self.cycles.append(path[path.index(node):] + [node])
 
+    def cycle_edges(self):
+        """Вернуть множество рёбер, входящих в найденные циклы."""
+        return {
+            (cycle[index], cycle[index + 1])
+            for cycle in self.cycles
+            for index in range(len(cycle) - 1)
+        }
+
 
 def fetch_safely(source, name, warnings):
     """Получить зависимости узла; при ошибке считать узел листом."""
@@ -518,13 +552,136 @@ def load_order(graph):
     return order
 
 
-def print_graph(graph):
-    """Вывести граф зависимостей в виде списков смежности."""
-    edge_count = sum(len(children) for children in graph.edges.values())
-    print(f"Граф зависимостей пакета {graph.root} "
-          f"(узлов: {len(graph.edges)}, рёбер: {edge_count}):")
+def child_entries(graph, name, prefix, path):
+    """Подготовить записи стека для детей узла в ASCII-дереве."""
+    children = graph.edges.get(name, [])
+    last = len(children) - 1
+    entries = [
+        (child, prefix, index == last, path)
+        for index, child in enumerate(children)
+    ]
+    return entries[::-1]
+
+
+def node_mark(name, path, expanded):
+    """Вернуть пометку узла: цикл, повтор или пустую строку."""
+    if name in path:
+        return MARK_CYCLE
+    if name in expanded:
+        return MARK_REPEAT
+    return ""
+
+
+def ascii_tree(graph):
+    """Построить ASCII-дерево зависимостей без рекурсии."""
+    lines = [graph.root]
+    expanded = {graph.root}
+    stack = child_entries(graph, graph.root, "", (graph.root,))
+    while stack:
+        name, prefix, is_last, path = stack.pop()
+        mark = node_mark(name, path, expanded)
+        connector = TREE_LAST if is_last else TREE_BRANCH
+        lines.append(prefix + connector + name + mark)
+        if not mark:
+            expanded.add(name)
+            child_prefix = prefix + (TREE_SPACE if is_last else TREE_PIPE)
+            stack.extend(
+                child_entries(graph, name, child_prefix, path + (name,))
+            )
+    return lines
+
+
+def to_plantuml(graph):
+    """Сформировать описание графа на языке диаграмм PlantUML."""
+    aliases = {name: f"n{index}" for index, name in enumerate(graph.edges)}
+    lines = ["@startuml", "skinparam shadowing false"]
+    for name, alias in aliases.items():
+        color = " #LightBlue" if name == graph.root else ""
+        lines.append(f'rectangle "{name}" as {alias}{color}')
+    cycle_edges = graph.cycle_edges()
     for name, children in graph.edges.items():
-        print(f"  {name} -> {', '.join(children) or '(нет зависимостей)'}")
+        for child in children:
+            arrow = "-[#red]->" if (name, child) in cycle_edges else "-->"
+            lines.append(f"{aliases[name]} {arrow} {aliases[child]}")
+    lines.append("@enduml")
+    return "\n".join(lines) + "\n"
+
+
+def encode_plantuml(text):
+    """Закодировать текст диаграммы для URL сервера PlantUML."""
+    compressor = zlib.compressobj(
+        zlib.Z_BEST_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS
+    )
+    data = compressor.compress(text.encode("utf-8")) + compressor.flush()
+    data += b"\0" * (-len(data) % BASE64_GROUP)
+    encoded = base64.b64encode(data).decode("ascii")
+    return encoded.translate(BASE64_TO_PLANTUML)
+
+
+def render_local(puml_path):
+    """Отрисовать PNG локально установленной утилитой plantuml."""
+    command = ["plantuml", "-tpng", str(puml_path)]
+    try:
+        subprocess.run(
+            command, check=True, capture_output=True, timeout=PLANTUML_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise VisualizationError(
+            f"plantuml завершился с ошибкой: {error}"
+        ) from error
+
+
+def render_image(puml_path, text):
+    """Получить PNG: локальный plantuml или сервер plantuml.com."""
+    png_path = puml_path.with_suffix(".png")
+    if shutil.which("plantuml"):
+        render_local(puml_path)
+        return png_path
+    try:
+        png_path.write_bytes(fetch(PLANTUML_SERVER + encode_plantuml(text)))
+    except RepositoryError as error:
+        raise VisualizationError(
+            f"сервер PlantUML недоступен: {error}"
+        ) from error
+    return png_path
+
+
+def safe_file_name(name):
+    """Превратить имя пакета в безопасное имя файла."""
+    return re.sub(r"[^\w.\-]", "_", name)
+
+
+def output_stem(graph, config):
+    """Выбрать имя выходных файлов (в тестовом режиме — с именем графа)."""
+    stem = safe_file_name(graph.root)
+    if config.test_mode:
+        stem = f"{Path(config.repository).stem}_{stem}"
+    return stem
+
+
+def visualize(graph, stem, output_dir, show):
+    """Сохранить .puml, получить изображение и открыть его."""
+    text = to_plantuml(graph)
+    print("Описание графа на языке PlantUML:")
+    print(text)
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    puml_path = directory / f"{stem}.puml"
+    puml_path.write_text(text, encoding="utf-8")
+    print(f"Файл PlantUML: {puml_path}")
+    if not show:
+        return
+    png_path = render_image(puml_path, text)
+    print(f"Изображение графа: {png_path}")
+    webbrowser.open(png_path.resolve().as_uri())
+
+
+def print_tree(graph):
+    """Вывести ASCII-дерево зависимостей с легендой."""
+    print("Дерево зависимостей:")
+    print("\n".join(ascii_tree(graph)))
+    print(f"{MARK_REPEAT.strip()} — поддерево уже показано выше; "
+          f"{MARK_CYCLE.strip()} — циклическая зависимость")
     print()
 
 
@@ -540,13 +697,23 @@ def print_load_order(graph):
 def print_problems(graph):
     """Вывести найденные циклы и предупреждения."""
     if graph.cycles:
-        print("Обнаружены циклические зависимости (замыкающие рёбра")
-        print("не учитываются при расчёте порядка загрузки):")
+        print("Обнаружены циклические зависимости:")
         for cycle in graph.cycles:
             print("  " + " -> ".join(cycle))
         print()
     for warning in graph.warnings:
         print(f"Предупреждение: {warning}", file=sys.stderr)
+
+
+def report(graph, config, args):
+    """Вывести все результаты работы программы."""
+    if config.ascii_tree:
+        print_tree(graph)
+    if args.load_order:
+        print_load_order(graph)
+    print_problems(graph)
+    stem = output_stem(graph, config)
+    visualize(graph, stem, args.output, not args.no_image)
 
 
 def parse_args(argv):
@@ -562,6 +729,14 @@ def parse_args(argv):
         "--load-order", action="store_true",
         help="вывести порядок загрузки зависимостей",
     )
+    parser.add_argument(
+        "-o", "--output", default=DEFAULT_OUTPUT_DIR,
+        help="каталог для .puml и .png файлов",
+    )
+    parser.add_argument(
+        "--no-image", action="store_true",
+        help="не строить и не открывать изображение графа",
+    )
     return parser.parse_args(argv)
 
 
@@ -571,17 +746,16 @@ def run(args):
         config = load_config(args.config)
         source = create_source(config)
         graph = build_graph(source, source.canonical_name(config.package_name))
+        report(graph, config, args)
     except ConfigError as error:
         print(f"Ошибка конфигурации: {error}", file=sys.stderr)
         return EXIT_ERROR
     except RepositoryError as error:
         print(f"Ошибка репозитория: {error}", file=sys.stderr)
         return EXIT_ERROR
-    if args.load_order:
-        print_load_order(graph)
-    else:
-        print_graph(graph)
-    print_problems(graph)
+    except VisualizationError as error:
+        print(f"Ошибка визуализации: {error}", file=sys.stderr)
+        return EXIT_ERROR
     return EXIT_OK
 
 

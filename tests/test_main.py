@@ -255,3 +255,32 @@ class TestLoadOrder(unittest.TestCase):
         """При цикле порядок строится, каждый узел один раз."""
         order = self.order_for({"A": ["B"], "B": ["C"], "C": ["A"]})
         self.assertEqual(order, ["C", "B", "A"])
+
+class TestVisualization(unittest.TestCase):
+    """Этап 5: PlantUML и ASCII-дерево."""
+
+    def setUp(self):
+        """Построить граф с ромбом и циклом."""
+        edges = {"A": ["B", "C"], "B": ["D"], "C": ["D"], "D": ["B"]}
+        self.graph = main.build_graph(FakeSource(edges), "A")
+
+    def test_encode_matches_plantuml_reference(self):
+        """Кодирование совпадает с примером из документации PlantUML."""
+        code = main.encode_plantuml("Bob -> Alice : hello")
+        self.assertEqual(code, "SyfFKj2rKt3CoKnELR1Io4ZDoSa70000")
+
+    def test_plantuml_text(self):
+        """Описание содержит узлы, рёбра и выделенное ребро цикла."""
+        text = main.to_plantuml(self.graph)
+        self.assertTrue(text.startswith("@startuml"))
+        self.assertIn('rectangle "D" as', text)
+        self.assertIn("-[#red]->", text)
+        self.assertTrue(text.rstrip().endswith("@enduml"))
+
+    def test_ascii_tree_marks(self):
+        """Повторы и циклы помечаются в ASCII-дереве."""
+        lines = main.ascii_tree(self.graph)
+        self.assertEqual(lines[0], "A")
+        self.assertIn("├── B", lines)
+        self.assertTrue(any(line.endswith(main.MARK_CYCLE) for line in lines))
+        self.assertTrue(any(line.endswith(main.MARK_REPEAT) for line in lines))
