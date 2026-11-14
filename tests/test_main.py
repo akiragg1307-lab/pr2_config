@@ -103,3 +103,69 @@ class TestConfig(TempDirTestCase):
         """При ошибке конфигурации main возвращает ненулевой код."""
         code = main.main(["-c", str(self.tmp / "absent.ini")])
         self.assertEqual(code, main.EXIT_ERROR)
+
+POM_XML = b"""<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <parent>
+    <groupId>org.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>7</version>
+  </parent>
+  <artifactId>app</artifactId>
+  <properties><lib.version>2.1</lib.version></properties>
+  <dependencies>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>lib</artifactId>
+      <version>${lib.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <version>4.13.2</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+"""
+
+
+class TestPom(unittest.TestCase):
+    """Этап 2: разбор POM-файлов без сторонних библиотек."""
+
+    def test_parse_pom_inherits_parent(self):
+        """groupId и version наследуются от родителя."""
+        pom = main.parse_pom(POM_XML)
+        self.assertEqual(pom.group_id, "org.example")
+        self.assertEqual(pom.version, "7")
+        self.assertEqual(pom.parent, ("org.example", "parent", "7"))
+        self.assertEqual(len(pom.dependencies), len(["lib", "junit"]))
+
+    def test_interpolate(self):
+        """Свойства ${...} подставляются, в том числе вложенные."""
+        props = {"a": "${b}", "b": "1.0"}
+        self.assertEqual(main.interpolate("v${a}", props), "v1.0")
+        self.assertEqual(main.interpolate("${x}", props), "${x}")
+
+    def test_pick_from_range(self):
+        """Из диапазона версий выбирается граница."""
+        self.assertEqual(main.pick_from_range("[1.2,2.0)"), "1.2")
+        self.assertEqual(main.pick_from_range("(,3.0]"), "3.0")
+        self.assertEqual(main.pick_from_range("4.0"), "4.0")
+
+    def test_resolve_uses_management(self):
+        """Версия без <version> берётся из dependencyManagement."""
+        repository = main.MavenRepository("https://example.org/maven2")
+        raw = dict.fromkeys(main.RAW_DEPENDENCY_KEYS, "")
+        raw.update(groupId="org.example", artifactId="core")
+        management = {"org.example:core": {"version": "${core.v}"}}
+        dependency = repository.resolve(raw, {"core.v": "3.3"}, management)
+        self.assertEqual(dependency.name, "org.example:core:3.3")
+        self.assertTrue(dependency.is_transitive())
+
+    def test_test_scope_not_transitive(self):
+        """Зависимости test и optional не попадают в граф."""
+        test_dep = main.Dependency("g", "a", "1", scope="test")
+        optional_dep = main.Dependency("g", "b", "1", optional=True)
+        self.assertFalse(test_dep.is_transitive())
+        self.assertFalse(optional_dep.is_transitive())
