@@ -229,3 +229,29 @@ class TestGraph(TempDirTestCase):
         chain = {f"N{i}": [f"N{i + 1}"] for i in range(length)}
         graph = main.build_graph(FakeSource(chain), "N0")
         self.assertEqual(len(graph.edges), length + 1)
+
+class TestLoadOrder(unittest.TestCase):
+    """Этап 4: порядок загрузки зависимостей."""
+
+    def order_for(self, edges):
+        """Построить граф и вернуть порядок загрузки."""
+        return main.load_order(main.build_graph(FakeSource(edges), "A"))
+
+    def test_dependencies_before_dependents(self):
+        """Каждая зависимость загружается раньше зависящего пакета."""
+        edges = {"A": ["B", "C"], "B": ["D"], "C": ["D"], "D": ["E"]}
+        order = self.order_for(edges)
+        self.assertEqual(order[-1], "A")
+        for name, children in edges.items():
+            for child in children:
+                self.assertLess(order.index(child), order.index(name))
+
+    def test_each_package_once(self):
+        """Общая зависимость присутствует в порядке один раз."""
+        order = self.order_for({"A": ["B", "C"], "B": ["D"], "C": ["D"]})
+        self.assertEqual(sorted(order), ["A", "B", "C", "D"])
+
+    def test_cycle_does_not_hang(self):
+        """При цикле порядок строится, каждый узел один раз."""
+        order = self.order_for({"A": ["B"], "B": ["C"], "C": ["A"]})
+        self.assertEqual(order, ["C", "B", "A"])

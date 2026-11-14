@@ -1,8 +1,8 @@
 """Инструмент визуализации графа зависимостей Maven-пакетов.
 
-Этап 3. Основные операции: построение графа зависимостей с учётом
-транзитивности алгоритмом DFS без рекурсии, обработка циклических
-зависимостей и режим работы с тестовым репозиторием.
+Этап 4. Дополнительные операции: режим вывода порядка загрузки
+зависимостей (флаг --load-order) — зависимости идут раньше пакетов,
+которые от них зависят.
 """
 
 import argparse
@@ -497,6 +497,27 @@ def build_graph(source, root):
     return graph
 
 
+def load_order(graph):
+    """Вычислить порядок загрузки: зависимости раньше зависящих.
+
+    Это обратный топологический порядок, полученный пост-порядком
+    итеративного DFS. Рёбра, замыкающие цикл, пропускаются.
+    """
+    order = []
+    visited = {graph.root}
+    stack = [(graph.root, iter(graph.edges.get(graph.root, [])))]
+    while stack:
+        node, children = stack[-1]
+        child = next(children, None)
+        if child is None:
+            stack.pop()
+            order.append(node)
+        elif child not in visited:
+            visited.add(child)
+            stack.append((child, iter(graph.edges.get(child, []))))
+    return order
+
+
 def print_graph(graph):
     """Вывести граф зависимостей в виде списков смежности."""
     edge_count = sum(len(children) for children in graph.edges.values())
@@ -507,15 +528,23 @@ def print_graph(graph):
     print()
 
 
+def print_load_order(graph):
+    """Вывести порядок загрузки зависимостей."""
+    print(f"Порядок загрузки зависимостей для пакета {graph.root}:")
+    for number, name in enumerate(load_order(graph), start=1):
+        note = " (анализируемый пакет)" if name == graph.root else ""
+        print(f"  {number}. {name}{note}")
+    print()
+
+
 def print_problems(graph):
     """Вывести найденные циклы и предупреждения."""
     if graph.cycles:
-        print("Обнаружены циклические зависимости:")
+        print("Обнаружены циклические зависимости (замыкающие рёбра")
+        print("не учитываются при расчёте порядка загрузки):")
         for cycle in graph.cycles:
             print("  " + " -> ".join(cycle))
         print()
-    else:
-        print("Циклических зависимостей нет.")
     for warning in graph.warnings:
         print(f"Предупреждение: {warning}", file=sys.stderr)
 
@@ -528,6 +557,10 @@ def parse_args(argv):
     parser.add_argument(
         "-c", "--config", default=DEFAULT_CONFIG,
         help="путь к конфигурационному INI-файлу",
+    )
+    parser.add_argument(
+        "--load-order", action="store_true",
+        help="вывести порядок загрузки зависимостей",
     )
     return parser.parse_args(argv)
 
@@ -544,7 +577,10 @@ def run(args):
     except RepositoryError as error:
         print(f"Ошибка репозитория: {error}", file=sys.stderr)
         return EXIT_ERROR
-    print_graph(graph)
+    if args.load_order:
+        print_load_order(graph)
+    else:
+        print_graph(graph)
     print_problems(graph)
     return EXIT_OK
 
